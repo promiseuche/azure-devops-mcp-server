@@ -1175,7 +1175,7 @@ See `.env.example` for all available variables.
 
 If you find this project helpful and would like to support my work, consider buying me a coffee!
 
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Support%20My%20Work-orange?style=for-the-badge&logo=buymeacoffee)](https://buymeacoffee.com/devopswithdami)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Support%20My%20Work-orange?style=for-the-badge&logo=buymeacoffee)](https://buymeacoffee.com/promiseuche)
 
 Your support helps me continue creating open-source tools and improving this project!
 
