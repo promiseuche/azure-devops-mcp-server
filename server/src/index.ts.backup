@@ -1,0 +1,1444 @@
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  Tool,
+} from '@modelcontextprotocol/sdk/types.js';
+import { AzureDevOpsClient } from './azure-devops-client.js';
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import OpenAI from 'openai';
+
+dotenv.config();
+
+// Initialize Azure OpenAI
+const openai = new OpenAI({
+  apiKey: process.env.AZURE_OPENAI_API_KEY,
+  baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT_NAME}`,
+  defaultQuery: { 'api-version': process.env.AZURE_OPENAI_API_VERSION },
+});
+
+// Create MCP server
+const server = new Server(
+  {
+    name: 'azure-devops-mcp-server',
+    version: '1.0.0',
+  },
+  {
+    capabilities: {
+      tools: {},
+    },
+  }
+);
+
+const azureClient = new AzureDevOpsClient();
+
+// Define MCP tools
+const tools: Tool[] = [
+  {
+    name: 'list_projects',
+    description: 'List all projects in the Azure DevOps organization',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'list_project_teams',
+    description: 'Retrieve a list of teams for the specified Azure DevOps project.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: {
+          type: 'string',
+          description: 'The name or ID of the Azure DevOps project.',
+        },
+        mine: {
+          type: 'boolean',
+          description: 'If true, only return teams that the authenticated user is a member of.',
+        },
+        top: {
+          type: 'number',
+          description: 'The maximum number of teams to return. Defaults to 100.',
+        },
+        skip: {
+          type: 'number',
+          description: 'The number of teams to skip for pagination. Defaults to 0.',
+        },
+      },
+      required: ['project'],
+    },
+  },
+  {
+    name: 'get_identity_ids',
+    description: 'Retrieve Azure DevOps identity IDs for a provided search filter.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        searchFilter: {
+          type: 'string',
+          description: 'Search filter (unique name, display name, email) to retrieve identity IDs for.',
+        },
+      },
+      required: ['searchFilter'],
+    },
+  },
+  {
+    name: 'query_work_items',
+    description: 'Query work items using WIQL (Azure DevOps Query Language)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        wiql: {
+          type: 'string',
+          description: 'WIQL query string, e.g., SELECT [System.Id] FROM WorkItems WHERE [System.State] = \'Active\'',
+        },
+      },
+      required: ['wiql'],
+    },
+  },
+  {
+    name: 'get_work_items_by_ids',
+    description: 'Get work items by their IDs',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ids: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Array of work item IDs',
+        },
+      },
+      required: ['ids'],
+    },
+  },
+  {
+    name: 'get_builds',
+    description: 'Get recent builds for the project',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        definitionId: {
+          type: 'number',
+          description: 'Optional build definition ID to filter',
+        },
+        top: {
+          type: 'number',
+          description: 'Number of builds to retrieve (default 10)',
+          default: 10,
+        },
+      },
+    },
+  },
+  {
+    name: 'get_releases',
+    description: 'Get recent releases for the project',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        top: {
+          type: 'number',
+          description: 'Number of releases to retrieve (default 10)',
+          default: 10,
+        },
+      },
+    },
+  },
+  {
+    name: 'create_work_item',
+    description: 'Create a new work item in Azure DevOps (uses the default project configured in the environment). Provide work item type and title. The project is already set, so you do not need to specify it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        workItemType: {
+          type: 'string',
+          description: 'Type of work item (e.g., Issue, Task, Bug, User Story). If the user says "issue work item", use "Issue". If they say "bug", use "Bug". If they say "task", use "Task".',
+        },
+        title: {
+          type: 'string',
+          description: 'Title of the work item',
+        },
+        description: {
+          type: 'string',
+          description: 'Optional description',
+        },
+        additionalFields: {
+          type: 'object',
+          description: 'Additional fields as key-value pairs',
+        },
+      },
+      required: ['workItemType', 'title'],
+    },
+  },
+  {
+    name: 'update_work_item',
+    description: 'Update fields of an existing work item in Azure DevOps. Provide the work item ID and a fields object with field names (e.g., System.Description) and new values. You can also add an optional comment. Common field mappings: "description" -> System.Description, "title" -> System.Title, "state" -> System.State, "assigned to" -> System.AssignedTo.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: {
+          type: 'number',
+          description: 'ID of the work item to update',
+        },
+        fields: {
+          type: 'object',
+          description: 'Fields to update as key-value pairs (e.g., {"System.Description": "new description", "System.Title": "new title"}). If the user mentions a field like "description", map it to System.Description.',
+        },
+        comment: {
+          type: 'string',
+          description: 'Optional comment for the history',
+        },
+      },
+      required: ['id', 'fields'],
+    },
+  },
+  {
+    name: 'assign_work_item',
+    description: 'Assign a work item to a user. Provide the work item ID and the assignee (user display name or email). Optionally add a comment.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: {
+          type: 'number',
+          description: 'ID of the work item to assign',
+        },
+        assignee: {
+          type: 'string',
+          description: 'User to assign the work item to (e.g., "John Doe", "john@example.com")',
+        },
+        comment: {
+          type: 'string',
+          description: 'Optional comment for the history',
+        },
+      },
+      required: ['id', 'assignee'],
+    },
+  },
+  {
+    name: 'list_repositories',
+    description: 'List repositories in a project (default project used if not specified)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: {
+          type: 'string',
+          description: 'Optional project name or ID. If not provided, uses the default project.',
+        },
+      },
+    },
+  },
+  {
+    name: 'list_branches',
+    description: 'List branches in a repository',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        repositoryId: {
+          type: 'string',
+          description: 'Repository ID',
+        },
+        project: {
+          type: 'string',
+          description: 'Optional project name or ID. If not provided, uses the default project.',
+        },
+      },
+      required: ['repositoryId'],
+    },
+  },
+  {
+    name: 'list_pull_requests',
+    description: 'List pull requests in a repository or project',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        repositoryId: {
+          type: 'string',
+          description: 'Optional repository ID to filter',
+        },
+        project: {
+          type: 'string',
+          description: 'Optional project name or ID. If not provided, uses the default project.',
+        },
+        top: {
+          type: 'number',
+          description: 'Number of pull requests to retrieve (default 100)',
+          default: 100,
+        },
+        status: {
+          type: 'string',
+          description: 'Pull request status (active, completed, abandoned). Default active.',
+          default: 'active',
+        },
+      },
+    },
+  },
+  {
+    name: 'get_pull_request',
+    description: 'Get details of a specific pull request',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        repositoryId: {
+          type: 'string',
+          description: 'Repository ID',
+        },
+        pullRequestId: {
+          type: 'number',
+          description: 'Pull request ID',
+        },
+        project: {
+          type: 'string',
+          description: 'Optional project name or ID. If not provided, uses the default project.',
+        },
+      },
+      required: ['repositoryId', 'pullRequestId'],
+    },
+  },
+  {
+    name: 'search_code',
+    description: 'Search for code across repositories',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        searchText: {
+          type: 'string',
+          description: 'Search text',
+        },
+        project: {
+          type: 'string',
+          description: 'Optional project name or ID. If not provided, uses the default project.',
+        },
+        repository: {
+          type: 'string',
+          description: 'Optional repository name or ID to filter',
+        },
+        top: {
+          type: 'number',
+          description: 'Number of results to retrieve (default 5)',
+          default: 5,
+        },
+      },
+      required: ['searchText'],
+    },
+  },
+  {
+    name: 'search_work_items',
+    description: 'Search for work items using text search',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        searchText: {
+          type: 'string',
+          description: 'Search text',
+        },
+        project: {
+          type: 'string',
+          description: 'Optional project name or ID. If not provided, uses the default project.',
+        },
+        top: {
+          type: 'number',
+          description: 'Number of results to retrieve (default 10)',
+          default: 10,
+        },
+      },
+      required: ['searchText'],
+    },
+  },
+  {
+    name: 'list_wikis',
+    description: 'List wikis in a project',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: {
+          type: 'string',
+          description: 'Optional project name or ID. If not provided, uses the default project.',
+        },
+      },
+    },
+  },
+  {
+    name: 'get_wiki_page',
+    description: 'Get content of a wiki page',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        wikiIdentifier: {
+          type: 'string',
+          description: 'Wiki identifier (ID or name)',
+        },
+        project: {
+          type: 'string',
+          description: 'Optional project name or ID. If not provided, uses the default project.',
+        },
+        path: {
+          type: 'string',
+          description: 'Wiki page path (default "/")',
+          default: '/',
+        },
+      },
+      required: ['wikiIdentifier'],
+    },
+  },
+  {
+    name: 'list_team_iterations',
+    description: 'List iterations for a team',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: {
+          type: 'string',
+          description: 'Project name or ID',
+        },
+        team: {
+          type: 'string',
+          description: 'Team name or ID',
+        },
+      },
+      required: ['project', 'team'],
+    },
+  },
+  {
+    name: 'list_test_plans',
+    description: 'List test plans in a project',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: {
+          type: 'string',
+          description: 'Project name or ID',
+        },
+      },
+      required: ['project'],
+    },
+  },
+];
+
+// Handle ListTools request
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools,
+}));
+
+// Handle CallTool request
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+  try {
+    switch (name) {
+      case 'list_projects': {
+        const projects = await azureClient.getProjects();
+        if (projects.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'No projects found.',
+              },
+            ],
+          };
+        }
+        const table = projects.map(p => `| ${p.id} | ${p.name} | ${p.description || ''} | ${p.url} |`).join('\n');
+        const formatted = `## Projects (${projects.length})\n| ID | Name | Description | URL |\n|----|------|-------------|-----|\n${table}`;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: formatted,
+            },
+          ],
+        };
+      }
+      case 'query_work_items': {
+        const wiql = args?.wiql as string;
+        if (!wiql) {
+          throw new Error('wiql argument is required');
+        }
+        const workItems = await azureClient.queryWorkItems(wiql);
+        if (workItems.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'No work items match the query.',
+              },
+            ],
+          };
+        }
+        const table = workItems.map(wi => {
+          const fields = wi.fields;
+          return `| ${wi.id} | ${fields['System.Title'] || ''} | ${fields['System.State'] || ''} | ${fields['System.AssignedTo']?.displayName || ''} | ${fields['System.WorkItemType'] || ''} |`;
+        }).join('\n');
+        const formatted = `## Work Items (${workItems.length})\n| ID | Title | State | Assigned To | Type |\n|----|-------|-------|-------------|------|\n${table}`;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: formatted,
+            },
+          ],
+        };
+      }
+      case 'get_work_items_by_ids': {
+        const ids = args?.ids as number[];
+        if (!ids || !Array.isArray(ids)) {
+          throw new Error('ids argument must be an array of numbers');
+        }
+        const workItems = await azureClient.getWorkItems(ids);
+        if (workItems.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'No work items found with those IDs.',
+              },
+            ],
+          };
+        }
+        const table = workItems.map(wi => {
+          const fields = wi.fields;
+          return `| ${wi.id} | ${fields['System.Title'] || ''} | ${fields['System.State'] || ''} | ${fields['System.AssignedTo']?.displayName || ''} | ${fields['System.WorkItemType'] || ''} |`;
+        }).join('\n');
+        const formatted = `## Work Items (${workItems.length})\n| ID | Title | State | Assigned To | Type |\n|----|-------|-------|-------------|------|\n${table}`;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: formatted,
+            },
+          ],
+        };
+      }
+      case 'get_builds': {
+        const definitionId = args?.definitionId as number | undefined;
+        const top = (args?.top as number) || 10;
+        const builds = await azureClient.getBuilds(definitionId, top);
+        if (builds.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'No builds found.',
+              },
+            ],
+          };
+        }
+        const table = builds.map(b => `| ${b.id} | ${b.buildNumber} | ${b.status} | ${b.result} | ${b.queueTime} | ${b.sourceBranch} |`).join('\n');
+        const formatted = `## Builds (${builds.length})\n| ID | Build Number | Status | Result | Queue Time | Branch |\n|----|--------------|--------|--------|------------|--------|\n${table}`;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: formatted,
+            },
+          ],
+        };
+      }
+      case 'get_releases': {
+        const top = (args?.top as number) || 10;
+        const releases = await azureClient.getReleases(top);
+        if (releases.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'No releases found.',
+              },
+            ],
+          };
+        }
+        const table = releases.map(r => `| ${r.id} | ${r.name} | ${r.status} | ${r.createdOn} | ${r.modifiedOn} |`).join('\n');
+        const formatted = `## Releases (${releases.length})\n| ID | Name | Status | Created | Modified |\n|----|------|--------|---------|----------|\n${table}`;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: formatted,
+            },
+          ],
+        };
+      }
+      case 'create_work_item': {
+        const workItemType = args?.workItemType as string;
+        const title = args?.title as string;
+        const description = args?.description as string | undefined;
+        const additionalFields = args?.additionalFields as Record<string, any> | undefined;
+        if (!workItemType || !title) {
+          throw new Error('workItemType and title are required');
+        }
+        const workItem = await azureClient.createWorkItem(workItemType, title, description, additionalFields);
+        const formatted = `✅ Work item created successfully!
+**ID**: ${workItem.id}
+**Type**: ${workItemType}
+**Title**: ${title}
+**URL**: ${workItem.url}
+${description ? `**Description**: ${description}` : ''}
+`;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: formatted,
+            },
+          ],
+        };
+      }
+      case 'update_work_item': {
+        const id = args?.id as number;
+        const fields = args?.fields as Record<string, any>;
+        const comment = args?.comment as string | undefined;
+        if (!id || !fields) {
+          throw new Error('id and fields are required');
+        }
+        const workItem = await azureClient.updateWorkItem(id, fields, comment);
+        const fieldList = Object.entries(fields).map(([key, val]) => `- **${key}**: ${val}`).join('\n');
+        const formatted = `✅ Work item ${workItem.id} updated successfully!
+**Updated fields**:
+${fieldList}
+${comment ? `**Comment**: ${comment}` : ''}`;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: formatted,
+            },
+          ],
+        };
+      }
+      case 'assign_work_item': {
+        const id = args?.id as number;
+        const assignee = args?.assignee as string;
+        const comment = args?.comment as string | undefined;
+        if (!id || !assignee) {
+          throw new Error('id and assignee are required');
+        }
+        const workItem = await azureClient.assignWorkItem(id, assignee, comment);
+        const formatted = `✅ Work item ${workItem.id} assigned to ${assignee} successfully!
+${comment ? `**Comment**: ${comment}` : ''}`;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: formatted,
+            },
+          ],
+        };
+      }
+      case 'list_repositories': {
+        const project = args?.project as string | undefined;
+        const repos = await azureClient.getRepositories(project);
+        if (repos.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'No repositories found.',
+              },
+            ],
+          };
+        }
+        const table = repos.map(r => `| ${r.id} | ${r.name} | ${r.isDisabled ? 'Disabled' : 'Active'} | ${r.isFork ? 'Fork' : 'No'} | ${r.webUrl} |`).join('\n');
+        const formatted = `## Repositories (${repos.length})\n| ID | Name | Status | Fork | URL |\n|----|------|--------|------|-----|\n${table}`;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: formatted,
+            },
+          ],
+        };
+      }
+      case 'list_branches': {
+        const repositoryId = args?.repositoryId as string;
+        const project = args?.project as string | undefined;
+        const branches = await azureClient.getBranches(repositoryId, project);
+        if (branches.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'No branches found.',
+              },
+            ],
+          };
+        }
+        const table = branches.map(b => `| ${b.name} | ${b.objectId.substring(0, 8)} | ${b.creator?.displayName || ''} |`).join('\n');
+        const formatted = `## Branches (${branches.length})\n| Name | Commit | Creator |\n|------|--------|---------|\n${table}`;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: formatted,
+            },
+          ],
+        };
+      }
+      case 'list_pull_requests': {
+        const repositoryId = args?.repositoryId as string | undefined;
+        const project = args?.project as string | undefined;
+        const top = (args?.top as number) || 100;
+        const status = (args?.status as string) || 'active';
+        const prs = await azureClient.getPullRequests(repositoryId, project, top, status);
+        if (prs.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'No pull requests found.',
+              },
+            ],
+          };
+        }
+        const table = prs.map(pr => `| ${pr.pullRequestId} | ${pr.title} | ${pr.status} | ${pr.createdBy.displayName} | ${pr.creationDate} |`).join('\n');
+        const formatted = `## Pull Requests (${prs.length})\n| ID | Title | Status | Created By | Created |\n|----|-------|--------|------------|---------|\n${table}`;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: formatted,
+            },
+          ],
+        };
+      }
+      case 'get_pull_request': {
+        const repositoryId = args?.repositoryId as string;
+        const pullRequestId = args?.pullRequestId as number;
+        const project = args?.project as string | undefined;
+        const pr = await azureClient.getPullRequestById(repositoryId, pullRequestId, project);
+        const formatted = `## Pull Request ${pr.pullRequestId}
+**Title**: ${pr.title}
+**Repository**: ${pr.repository.name}
+**Status**: ${pr.status}
+**Created By**: ${pr.createdBy.displayName} (${pr.createdBy.uniqueName})
+**Created**: ${pr.creationDate}
+**Source**: ${pr.sourceRefName}
+**Target**: ${pr.targetRefName}
+${pr.description ? `**Description**: ${pr.description}` : ''}`;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: formatted,
+            },
+          ],
+        };
+      }
+      case 'search_code': {
+        const searchText = args?.searchText as string;
+        const project = args?.project as string | undefined;
+        const repository = args?.repository as string | undefined;
+        const top = (args?.top as number) || 5;
+        const results = await azureClient.searchCode(searchText, project, repository, top);
+        if (results.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'No code search results found.',
+              },
+            ],
+          };
+        }
+        const table = results.map((r: any) => `| ${r.project?.name || ''} | ${r.repository?.name || ''} | ${r.path || ''} | ${r.matches?.length || 0} matches |`).join('\n');
+        const formatted = `## Code Search Results (${results.length})\n| Project | Repository | Path | Matches |\n|---------|------------|------|---------|\n${table}`;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: formatted,
+            },
+          ],
+        };
+      }
+      case 'search_work_items': {
+        const searchText = args?.searchText as string;
+        const project = args?.project as string | undefined;
+        const top = (args?.top as number) || 10;
+        const results = await azureClient.searchWorkItems(searchText, project, top);
+        if (results.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'No work item search results found.',
+              },
+            ],
+          };
+        }
+        const table = results.map((r: any) => `| ${r.fields?.['System.Id'] || ''} | ${r.fields?.['System.Title'] || ''} | ${r.fields?.['System.State'] || ''} | ${r.fields?.['System.WorkItemType'] || ''} |`).join('\n');
+        const formatted = `## Work Item Search Results (${results.length})\n| ID | Title | State | Type |\n|----|-------|-------|------|\n${table}`;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: formatted,
+            },
+          ],
+        };
+      }
+      case 'list_wikis': {
+        const project = args?.project as string | undefined;
+        const wikis = await azureClient.getWikis(project);
+        if (wikis.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'No wikis found.',
+              },
+            ],
+          };
+        }
+        const table = wikis.map(w => `| ${w.id} | ${w.name} | ${w.type} | ${w.projectId} |`).join('\n');
+        const formatted = `## Wikis (${wikis.length})\n| ID | Name | Type | Project ID |\n|----|------|------|------------|\n${table}`;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: formatted,
+            },
+          ],
+        };
+      }
+      case 'get_wiki_page': {
+        const wikiIdentifier = args?.wikiIdentifier as string;
+        const project = args?.project as string | undefined;
+        const path = (args?.path as string) || '/';
+        const content = await azureClient.getWikiPageContent(wikiIdentifier, project, path);
+        const formatted = `## Wiki Page: ${path}\n${content}`;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: formatted,
+            },
+          ],
+        };
+      }
+      case 'list_team_iterations': {
+        const project = args?.project as string;
+        const team = args?.team as string;
+        const iterations = await azureClient.getTeamIterations(project, team);
+        if (iterations.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'No iterations found for this team.',
+              },
+            ],
+          };
+        }
+        const table = iterations.map(i => `| ${i.id} | ${i.name} | ${i.path} | ${i.attributes.startDate || ''} - ${i.attributes.finishDate || ''} |`).join('\n');
+        const formatted = `## Iterations (${iterations.length})\n| ID | Name | Path | Dates |\n|----|------|------|-------|\n${table}`;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: formatted,
+            },
+          ],
+        };
+      }
+      case 'list_test_plans': {
+        const project = args?.project as string;
+        const testPlans = await azureClient.getTestPlans(project);
+        if (testPlans.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'No test plans found.',
+              },
+            ],
+          };
+        }
+        const table = testPlans.map(tp => `| ${tp.id} | ${tp.name} | ${tp.description || ''} | ${tp.areaPath || ''} | ${tp.iteration || ''} |`).join('\n');
+        const formatted = `## Test Plans (${testPlans.length})\n| ID | Name | Description | Area Path | Iteration |\n|----|------|-------------|-----------|-----------|\n${table}`;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: formatted,
+            },
+          ],
+        };
+      }
+      default:
+        throw new Error(`Unknown tool: ${name}`);
+    }
+  } catch (error: any) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Error: ${error.message}`,
+        },
+      ],
+      isError: true,
+    };
+  }
+});
+
+// Start HTTP API server for frontend
+const startHttpServer = () => {
+  const app = express();
+  const port = process.env.PORT || 3001;
+
+  app.use(cors());
+  app.use(express.json());
+
+  // Health check
+  app.get('/health', (req, res) => {
+    res.json({ status: 'ok' });
+  });
+
+  // List tools endpoint (for frontend)
+  app.get('/api/tools', (req, res) => {
+    res.json({ tools });
+  });
+
+  // Call tool endpoint (for frontend)
+  app.post('/api/tools/:name', async (req, res) => {
+    const { name } = req.params;
+    const args = req.body;
+    try {
+      // Simulate MCP tool call
+      const tool = tools.find(t => t.name === name);
+      if (!tool) {
+        return res.status(404).json({ error: 'Tool not found' });
+      }
+      // For simplicity, we directly call Azure DevOps client
+      // In a real scenario, you'd reuse the same logic as above
+      const azureClient = new AzureDevOpsClient();
+      let rawResult;
+      switch (name) {
+        case 'list_projects':
+          rawResult = await azureClient.getProjects();
+          break;
+        case 'query_work_items':
+          rawResult = await azureClient.queryWorkItems(args.wiql);
+          break;
+        case 'get_work_items_by_ids':
+          rawResult = await azureClient.getWorkItems(args.ids);
+          break;
+        case 'get_builds':
+          rawResult = await azureClient.getBuilds(args.definitionId, args.top);
+          break;
+        case 'get_releases':
+          rawResult = await azureClient.getReleases(args.top);
+          break;
+        case 'create_work_item':
+          rawResult = await azureClient.createWorkItem(
+            args.workItemType,
+            args.title,
+            args.description,
+            args.additionalFields
+          );
+          break;
+        case 'update_work_item':
+          rawResult = await azureClient.updateWorkItem(
+            args.id,
+            args.fields,
+            args.comment
+          );
+          break;
+        case 'assign_work_item':
+          rawResult = await azureClient.assignWorkItem(
+            args.id,
+            args.assignee,
+            args.comment
+          );
+          break;
+        case 'list_repositories':
+          rawResult = await azureClient.getRepositories(args.project);
+          break;
+        case 'list_branches':
+          rawResult = await azureClient.getBranches(args.repositoryId, args.project);
+          break;
+        case 'list_pull_requests':
+          rawResult = await azureClient.getPullRequests(args.repositoryId, args.project, args.top, args.status);
+          break;
+        case 'get_pull_request':
+          rawResult = await azureClient.getPullRequestById(args.repositoryId, args.pullRequestId, args.project);
+          break;
+        case 'search_code':
+          rawResult = await azureClient.searchCode(args.searchText, args.project, args.repository, args.top);
+          break;
+        case 'search_work_items':
+          rawResult = await azureClient.searchWorkItems(args.searchText, args.project, args.top);
+          break;
+        case 'list_wikis':
+          rawResult = await azureClient.getWikis(args.project);
+          break;
+        case 'get_wiki_page':
+          rawResult = await azureClient.getWikiPageContent(args.wikiIdentifier, args.project, args.path);
+          break;
+        case 'list_team_iterations':
+          rawResult = await azureClient.getTeamIterations(args.project, args.team);
+          break;
+        case 'list_test_plans':
+          rawResult = await azureClient.getTestPlans(args.project);
+          break;
+        default:
+          return res.status(400).json({ error: 'Unsupported tool' });
+      }
+      // Format the result
+      let formatted;
+      if (name === 'list_projects') {
+        const projects = rawResult as any[];
+        if (projects.length === 0) {
+          formatted = 'No projects found.';
+        } else {
+          const table = projects.map(p => `| ${p.id} | ${p.name} | ${p.description || ''} | ${p.url} |`).join('\n');
+          formatted = `## Projects (${projects.length})\n| ID | Name | Description | URL |\n|----|------|-------------|-----|\n${table}`;
+        }
+      } else if (name === 'query_work_items' || name === 'get_work_items_by_ids') {
+        const workItems = rawResult as any[];
+        if (workItems.length === 0) {
+          formatted = 'No work items found.';
+        } else {
+          const table = workItems.map(wi => {
+            const fields = wi.fields;
+            return `| ${wi.id} | ${fields['System.Title'] || ''} | ${fields['System.State'] || ''} | ${fields['System.AssignedTo']?.displayName || ''} | ${fields['System.WorkItemType'] || ''} |`;
+          }).join('\n');
+          formatted = `## Work Items (${workItems.length})\n| ID | Title | State | Assigned To | Type |\n|----|-------|-------|-------------|------|\n${table}`;
+        }
+      } else if (name === 'get_builds') {
+        const builds = rawResult as any[];
+        if (builds.length === 0) {
+          formatted = 'No builds found.';
+        } else {
+          const table = builds.map(b => `| ${b.id} | ${b.buildNumber} | ${b.status} | ${b.result} | ${b.queueTime} | ${b.sourceBranch} |`).join('\n');
+          formatted = `## Builds (${builds.length})\n| ID | Build Number | Status | Result | Queue Time | Branch |\n|----|--------------|--------|--------|------------|--------|\n${table}`;
+        }
+      } else if (name === 'get_releases') {
+        const releases = rawResult as any[];
+        if (releases.length === 0) {
+          formatted = 'No releases found.';
+        } else {
+          const table = releases.map(r => `| ${r.id} | ${r.name} | ${r.status} | ${r.createdOn} | ${r.modifiedOn} |`).join('\n');
+          formatted = `## Releases (${releases.length})\n| ID | Name | Status | Created | Modified |\n|----|------|--------|---------|----------|\n${table}`;
+        }
+      } else if (name === 'create_work_item') {
+        const workItem = rawResult as any;
+        formatted = `✅ Work item created successfully!
+**ID**: ${workItem.id}
+**Type**: ${args.workItemType}
+**Title**: ${args.title}
+**URL**: ${workItem.url}
+${args.description ? `**Description**: ${args.description}` : ''}`;
+      } else if (name === 'update_work_item') {
+        const workItem = rawResult as any;
+        const fields = args.fields || {};
+        const fieldList = Object.entries(fields).map(([key, val]) => `- **${key}**: ${val}`).join('\n');
+        formatted = `✅ Work item ${workItem.id} updated successfully!
+**Updated fields**:
+${fieldList}
+${args.comment ? `**Comment**: ${args.comment}` : ''}`;
+      } else if (name === 'assign_work_item') {
+        const workItem = rawResult as any;
+        formatted = `✅ Work item ${workItem.id} assigned to ${args.assignee} successfully!
+${args.comment ? `**Comment**: ${args.comment}` : ''}`;
+      } else if (name === 'list_repositories') {
+        const repos = rawResult as any[];
+        if (repos.length === 0) {
+          formatted = 'No repositories found.';
+        } else {
+          const table = repos.map(r => `| ${r.id} | ${r.name} | ${r.isDisabled ? 'Disabled' : 'Active'} | ${r.isFork ? 'Fork' : 'No'} | ${r.webUrl} |`).join('\n');
+          formatted = `## Repositories (${repos.length})\n| ID | Name | Status | Fork | URL |\n|----|------|--------|------|-----|\n${table}`;
+        }
+      } else if (name === 'list_branches') {
+        const branches = rawResult as any[];
+        if (branches.length === 0) {
+          formatted = 'No branches found.';
+        } else {
+          const table = branches.map(b => `| ${b.name} | ${b.objectId?.substring(0, 8) || ''} | ${b.creator?.displayName || ''} |`).join('\n');
+          formatted = `## Branches (${branches.length})\n| Name | Commit | Creator |\n|------|--------|---------|\n${table}`;
+        }
+      } else if (name === 'list_pull_requests') {
+        const prs = rawResult as any[];
+        if (prs.length === 0) {
+          formatted = 'No pull requests found.';
+        } else {
+          const table = prs.map(pr => `| ${pr.pullRequestId} | ${pr.title} | ${pr.status} | ${pr.createdBy?.displayName || ''} | ${pr.creationDate} |`).join('\n');
+          formatted = `## Pull Requests (${prs.length})\n| ID | Title | Status | Created By | Created |\n|----|-------|--------|------------|---------|\n${table}`;
+        }
+      } else if (name === 'get_pull_request') {
+        const pr = rawResult as any;
+        formatted = `## Pull Request ${pr.pullRequestId}
+**Title**: ${pr.title}
+**Repository**: ${pr.repository?.name || ''}
+**Status**: ${pr.status}
+**Created By**: ${pr.createdBy?.displayName || ''} (${pr.createdBy?.uniqueName || ''})
+**Created**: ${pr.creationDate}
+**Source**: ${pr.sourceRefName}
+**Target**: ${pr.targetRefName}
+${pr.description ? `**Description**: ${pr.description}` : ''}`;
+      } else if (name === 'search_code') {
+        const results = rawResult as any[];
+        if (results.length === 0) {
+          formatted = 'No code search results found.';
+        } else {
+          const table = results.map(r => `| ${r.project?.name || ''} | ${r.repository?.name || ''} | ${r.path || ''} | ${r.matches?.length || 0} matches |`).join('\n');
+          formatted = `## Code Search Results (${results.length})\n| Project | Repository | Path | Matches |\n|---------|------------|------|---------|\n${table}`;
+        }
+      } else if (name === 'search_work_items') {
+        const results = rawResult as any[];
+        if (results.length === 0) {
+          formatted = 'No work item search results found.';
+        } else {
+          const table = results.map(r => `| ${r.fields?.['System.Id'] || ''} | ${r.fields?.['System.Title'] || ''} | ${r.fields?.['System.State'] || ''} | ${r.fields?.['System.WorkItemType'] || ''} |`).join('\n');
+          formatted = `## Work Item Search Results (${results.length})\n| ID | Title | State | Type |\n|----|-------|-------|------|\n${table}`;
+        }
+      } else if (name === 'list_wikis') {
+        const wikis = rawResult as any[];
+        if (wikis.length === 0) {
+          formatted = 'No wikis found.';
+        } else {
+          const table = wikis.map(w => `| ${w.id} | ${w.name} | ${w.type} | ${w.projectId} |`).join('\n');
+          formatted = `## Wikis (${wikis.length})\n| ID | Name | Type | Project ID |\n|----|------|------|------------|\n${table}`;
+        }
+      } else if (name === 'get_wiki_page') {
+        const content = rawResult as string;
+        formatted = `## Wiki Page: ${args.path || '/'}\n${content}`;
+      } else if (name === 'list_team_iterations') {
+        const iterations = rawResult as any[];
+        if (iterations.length === 0) {
+          formatted = 'No iterations found for this team.';
+        } else {
+          const table = iterations.map(i => `| ${i.id} | ${i.name} | ${i.path} | ${i.attributes?.startDate || ''} - ${i.attributes?.finishDate || ''} |`).join('\n');
+          formatted = `## Iterations (${iterations.length})\n| ID | Name | Path | Dates |\n|----|------|------|-------|\n${table}`;
+        }
+      } else if (name === 'list_test_plans') {
+        const testPlans = rawResult as any[];
+        if (testPlans.length === 0) {
+          formatted = 'No test plans found.';
+        } else {
+          const table = testPlans.map(tp => `| ${tp.id} | ${tp.name} | ${tp.description || ''} | ${tp.areaPath || ''} | ${tp.iteration || ''} |`).join('\n');
+          formatted = `## Test Plans (${testPlans.length})\n| ID | Name | Description | Area Path | Iteration |\n|----|------|-------------|-----------|-----------|\n${table}`;
+        }
+      } else {
+        formatted = JSON.stringify(rawResult, null, 2);
+      }
+      res.json({ result: formatted, raw: rawResult });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Chat completion endpoint with OpenAI function calling
+  app.post('/api/chat', async (req, res) => {
+    const { message } = req.body;
+    if (!message || typeof message !== 'string') {
+      return res.status(400).json({ error: 'Message is required' });
+    }
+
+    try {
+      // Convert MCP tools to OpenAI function definitions
+      const functions = tools.map(tool => ({
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.inputSchema,
+      }));
+
+      const response = await openai.chat.completions.create({
+        model: process.env.AZURE_OPENAI_DEPLOYMENT_NAME!,
+        messages: [
+          {
+            role: 'system',
+            content: 'You are an assistant that helps users query and manage Azure DevOps. Use the provided functions to retrieve data, create work items, update work items (including fields like System.Description, System.Title, etc.), and manage builds/releases. When the user asks to create a work item, call the create_work_item function with workItemType and title. The project is already configured, so you do not need to ask for it. If the user mentions a project name, assume it matches the default project. When the user asks to list work items in a project, use the query_work_items function with a WIQL that selects all work items from that project (e.g., SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = \'terraform-modules\'). If the user asks something that cannot be answered with the available tools, respond politely.\n\nImportant mapping for update_work_item: When the user asks to update a field like "description", map it to System.Description in the fields object. Do NOT put the new value in the comment parameter. The comment parameter is only for adding a comment to the work item history, not for updating fields. If the user does not explicitly ask to add a comment, leave the comment parameter empty.',
+          },
+          { role: 'user', content: message },
+        ],
+        functions,
+        function_call: 'auto',
+      });
+
+      const choice = response.choices[0];
+      if (!choice.message) {
+        return res.status(500).json({ error: 'No response from OpenAI' });
+      }
+
+      // If OpenAI wants to call a function
+      if (choice.message.function_call) {
+        const functionName = choice.message.function_call.name;
+        let functionArgs;
+        try {
+          functionArgs = JSON.parse(choice.message.function_call.arguments || '{}');
+        } catch (e) {
+          functionArgs = {};
+        }
+
+        // Call the corresponding tool
+        const azureClient = new AzureDevOpsClient();
+        let rawResult;
+        switch (functionName) {
+          case 'list_projects':
+            rawResult = await azureClient.getProjects();
+            break;
+          case 'query_work_items':
+            rawResult = await azureClient.queryWorkItems(functionArgs.wiql);
+            break;
+          case 'get_work_items_by_ids':
+            rawResult = await azureClient.getWorkItems(functionArgs.ids);
+            break;
+          case 'get_builds':
+            rawResult = await azureClient.getBuilds(functionArgs.definitionId, functionArgs.top);
+            break;
+          case 'get_releases':
+            rawResult = await azureClient.getReleases(functionArgs.top);
+            break;
+          case 'create_work_item':
+            rawResult = await azureClient.createWorkItem(
+              functionArgs.workItemType,
+              functionArgs.title,
+              functionArgs.description,
+              functionArgs.additionalFields
+            );
+            break;
+          case 'update_work_item':
+            const fields = functionArgs.fields || {};
+            const safeFields = typeof fields === 'object' && fields !== null ? fields : {};
+            rawResult = await azureClient.updateWorkItem(
+              functionArgs.id,
+              safeFields,
+              functionArgs.comment
+            );
+            break;
+          case 'assign_work_item':
+            rawResult = await azureClient.assignWorkItem(
+              functionArgs.id,
+              functionArgs.assignee,
+              functionArgs.comment
+            );
+            break;
+          case 'list_repositories':
+            rawResult = await azureClient.getRepositories(functionArgs.project);
+            break;
+          case 'list_branches':
+            rawResult = await azureClient.getBranches(functionArgs.repositoryId, functionArgs.project);
+            break;
+          case 'list_pull_requests':
+            rawResult = await azureClient.getPullRequests(functionArgs.repositoryId, functionArgs.project, functionArgs.top, functionArgs.status);
+            break;
+          case 'get_pull_request':
+            rawResult = await azureClient.getPullRequestById(functionArgs.repositoryId, functionArgs.pullRequestId, functionArgs.project);
+            break;
+          case 'search_code':
+            rawResult = await azureClient.searchCode(functionArgs.searchText, functionArgs.project, functionArgs.repository, functionArgs.top);
+            break;
+          case 'search_work_items':
+            rawResult = await azureClient.searchWorkItems(functionArgs.searchText, functionArgs.project, functionArgs.top);
+            break;
+          case 'list_wikis':
+            rawResult = await azureClient.getWikis(functionArgs.project);
+            break;
+          case 'get_wiki_page':
+            rawResult = await azureClient.getWikiPageContent(functionArgs.wikiIdentifier, functionArgs.project, functionArgs.path);
+            break;
+          case 'list_team_iterations':
+            rawResult = await azureClient.getTeamIterations(functionArgs.project, functionArgs.team);
+            break;
+          case 'list_test_plans':
+            rawResult = await azureClient.getTestPlans(functionArgs.project);
+            break;
+          default:
+            return res.status(400).json({ error: `Unknown function: ${functionName}` });
+        }
+
+        // Format the result
+        let formatted;
+        if (functionName === 'list_projects') {
+          const projects = rawResult as any[];
+          if (projects.length === 0) {
+            formatted = 'No projects found.';
+          } else {
+            const table = projects.map(p => `| ${p.id} | ${p.name} | ${p.description || ''} | ${p.url} |`).join('\n');
+            formatted = `## Projects (${projects.length})\n| ID | Name | Description | URL |\n|----|------|-------------|-----|\n${table}`;
+          }
+        } else if (functionName === 'query_work_items' || functionName === 'get_work_items_by_ids') {
+          const workItems = rawResult as any[];
+          if (workItems.length === 0) {
+            formatted = 'No work items found.';
+          } else {
+            const table = workItems.map(wi => {
+              const fields = wi.fields;
+              return `| ${wi.id} | ${fields['System.Title'] || ''} | ${fields['System.State'] || ''} | ${fields['System.AssignedTo']?.displayName || ''} | ${fields['System.WorkItemType'] || ''} |`;
+            }).join('\n');
+            formatted = `## Work Items (${workItems.length})\n| ID | Title | State | Assigned To | Type |\n|----|-------|-------|-------------|------|\n${table}`;
+          }
+        } else if (functionName === 'get_builds') {
+          const builds = rawResult as any[];
+          if (builds.length === 0) {
+            formatted = 'No builds found.';
+          } else {
+            const table = builds.map(b => `| ${b.id} | ${b.buildNumber} | ${b.status} | ${b.result} | ${b.queueTime} | ${b.sourceBranch} |`).join('\n');
+            formatted = `## Builds (${builds.length})\n| ID | Build Number | Status | Result | Queue Time | Branch |\n|----|--------------|--------|--------|------------|--------|\n${table}`;
+          }
+        } else if (functionName === 'get_releases') {
+          const releases = rawResult as any[];
+          if (releases.length === 0) {
+            formatted = 'No releases found.';
+          } else {
+            const table = releases.map(r => `| ${r.id} | ${r.name} | ${r.status} | ${r.createdOn} | ${r.modifiedOn} |`).join('\n');
+            formatted = `## Releases (${releases.length})\n| ID | Name | Status | Created | Modified |\n|----|------|--------|---------|----------|\n${table}`;
+          }
+        } else if (functionName === 'create_work_item') {
+          const workItem = rawResult as any;
+          formatted = `✅ Work item created successfully!
+**ID**: ${workItem.id}
+**Type**: ${functionArgs.workItemType}
+**Title**: ${functionArgs.title}
+**URL**: ${workItem.url}
+${functionArgs.description ? `**Description**: ${functionArgs.description}` : ''}`;
+        } else if (functionName === 'update_work_item') {
+          const workItem = rawResult as any;
+          const fields = functionArgs.fields || {};
+          // Ensure fields is an object
+          const safeFields = typeof fields === 'object' && fields !== null ? fields : {};
+          const fieldList = Object.entries(safeFields).map(([key, val]) => `- **${key}**: ${val}`).join('\n');
+          formatted = `✅ Work item ${workItem.id} updated successfully!
+**Updated fields**:
+${fieldList}
+${functionArgs.comment ? `**Comment**: ${functionArgs.comment}` : ''}`;
+        } else if (functionName === 'assign_work_item') {
+          const workItem = rawResult as any;
+          formatted = `✅ Work item ${workItem.id} assigned to ${functionArgs.assignee} successfully!
+${functionArgs.comment ? `**Comment**: ${functionArgs.comment}` : ''}`;
+        } else if (functionName === 'list_repositories') {
+          const repos = rawResult as any[];
+          if (repos.length === 0) {
+            formatted = 'No repositories found.';
+          } else {
+            const table = repos.map(r => `| ${r.id} | ${r.name} | ${r.isDisabled ? 'Disabled' : 'Active'} | ${r.isFork ? 'Fork' : 'No'} | ${r.webUrl} |`).join('\n');
+            formatted = `## Repositories (${repos.length})\n| ID | Name | Status | Fork | URL |\n|----|------|--------|------|-----|\n${table}`;
+          }
+        } else if (functionName === 'list_branches') {
+          const branches = rawResult as any[];
+          if (branches.length === 0) {
+            formatted = 'No branches found.';
+          } else {
+            const table = branches.map(b => `| ${b.name} | ${b.objectId?.substring(0, 8) || ''} | ${b.creator?.displayName || ''} |`).join('\n');
+            formatted = `## Branches (${branches.length})\n| Name | Commit | Creator |\n|------|--------|---------|\n${table}`;
+          }
+        } else if (functionName === 'list_pull_requests') {
+          const prs = rawResult as any[];
+          if (prs.length === 0) {
+            formatted = 'No pull requests found.';
+          } else {
+            const table = prs.map(pr => `| ${pr.pullRequestId} | ${pr.title} | ${pr.status} | ${pr.createdBy?.displayName || ''} | ${pr.creationDate} |`).join('\n');
+            formatted = `## Pull Requests (${prs.length})\n| ID | Title | Status | Created By | Created |\n|----|-------|--------|------------|---------|\n${table}`;
+          }
+        } else if (functionName === 'get_pull_request') {
+          const pr = rawResult as any;
+          formatted = `## Pull Request ${pr.pullRequestId}
+**Title**: ${pr.title}
+**Repository**: ${pr.repository?.name || ''}
+**Status**: ${pr.status}
+**Created By**: ${pr.createdBy?.displayName || ''} (${pr.createdBy?.uniqueName || ''})
+**Created**: ${pr.creationDate}
+**Source**: ${pr.sourceRefName}
+**Target**: ${pr.targetRefName}
+${pr.description ? `**Description**: ${pr.description}` : ''}`;
+        } else if (functionName === 'search_code') {
+          const results = rawResult as any[];
+          if (results.length === 0) {
+            formatted = 'No code search results found.';
+          } else {
+            const table = results.map(r => `| ${r.project?.name || ''} | ${r.repository?.name || ''} | ${r.path || ''} | ${r.matches?.length || 0} matches |`).join('\n');
+            formatted = `## Code Search Results (${results.length})\n| Project | Repository | Path | Matches |\n|---------|------------|------|---------|\n${table}`;
+          }
+        } else if (functionName === 'search_work_items') {
+          const results = rawResult as any[];
+          if (results.length === 0) {
+            formatted = 'No work item search results found.';
+          } else {
+            const table = results.map(r => `| ${r.fields?.['System.Id'] || ''} | ${r.fields?.['System.Title'] || ''} | ${r.fields?.['System.State'] || ''} | ${r.fields?.['System.WorkItemType'] || ''} |`).join('\n');
+            formatted = `## Work Item Search Results (${results.length})\n| ID | Title | State | Type |\n|----|-------|-------|------|\n${table}`;
+          }
+        } else if (functionName === 'list_wikis') {
+          const wikis = rawResult as any[];
+          if (wikis.length === 0) {
+            formatted = 'No wikis found.';
+          } else {
+            const table = wikis.map(w => `| ${w.id} | ${w.name} | ${w.type} | ${w.projectId} |`).join('\n');
+            formatted = `## Wikis (${wikis.length})\n| ID | Name | Type | Project ID |\n|----|------|------|------------|\n${table}`;
+          }
+        } else if (functionName === 'get_wiki_page') {
+          const content = rawResult as string;
+          formatted = `## Wiki Page: ${functionArgs.path || '/'}\n${content}`;
+        } else if (functionName === 'list_team_iterations') {
+          const iterations = rawResult as any[];
+          if (iterations.length === 0) {
+            formatted = 'No iterations found for this team.';
+          } else {
+            const table = iterations.map(i => `| ${i.id} | ${i.name} | ${i.path} | ${i.attributes?.startDate || ''} - ${i.attributes?.finishDate || ''} |`).join('\n');
+            formatted = `## Iterations (${iterations.length})\n| ID | Name | Path | Dates |\n|----|------|------|-------|\n${table}`;
+          }
+        } else if (functionName === 'list_test_plans') {
+          const testPlans = rawResult as any[];
+          if (testPlans.length === 0) {
+            formatted = 'No test plans found.';
+          } else {
+            const table = testPlans.map(tp => `| ${tp.id} | ${tp.name} | ${tp.description || ''} | ${tp.areaPath || ''} | ${tp.iteration || ''} |`).join('\n');
+            formatted = `## Test Plans (${testPlans.length})\n| ID | Name | Description | Area Path | Iteration |\n|----|------|-------------|-----------|-----------|\n${table}`;
+          }
+        } else {
+          formatted = JSON.stringify(rawResult, null, 2);
+        }
+
+        // Get a final response from OpenAI with the formatted result
+        const secondResponse = await openai.chat.completions.create({
+          model: process.env.AZURE_OPENAI_DEPLOYMENT_NAME!,
+          messages: [
+            {
+              role: 'system',
+              content: 'You are an assistant that helps users query Azure DevOps. Use the provided functions to retrieve data, create work items, update work items, and manage builds/releases. The project is already configured, so you do not need to ask for it. When the user asks to list work items in a project, use the query_work_items function with a WIQL that selects all work items from that project (e.g., SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = \'terraform-modules\'). If the user asks something that cannot be answered with the available tools, respond politely.\n\nImportant mapping for update_work_item: When the user asks to update a field like "description", map it to System.Description in the fields object. Do NOT put the new value in the comment parameter. The comment parameter is only for adding a comment to the work item history, not for updating fields. If the user does not explicitly ask to add a comment, leave the comment parameter empty.',
+            },
+            { role: 'user', content: message },
+            choice.message,
+            {
+              role: 'function',
+              name: functionName,
+              content: formatted,
+            },
+          ],
+        });
+
+        const finalMessage = secondResponse.choices[0].message;
+        return res.json({
+          result: finalMessage.content,
+          tool_used: functionName,
+          raw_result: rawResult,
+        });
+      } else {
+        // No function call, just respond with the message
+        return res.json({
+          result: choice.message.content,
+          tool_used: null,
+        });
+      }
+    } catch (error: any) {
+      console.error('OpenAI error:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.listen(port, () => {
+    console.log(`HTTP API server listening on port ${port}`);
+  });
+};
+
+// Start servers
+if (process.argv.includes('--stdio')) {
+  // Run as MCP server over stdio
+  const transport = new StdioServerTransport();
+  server.connect(transport).then(() => {
+    console.error('Azure DevOps MCP server running on stdio');
+  });
+} else {
+  // Run as HTTP server (for development)
+  startHttpServer();
+  console.log('Running in HTTP mode (not MCP stdio). Use --stdio for MCP protocol.');
+}
