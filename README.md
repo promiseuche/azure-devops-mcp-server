@@ -1185,7 +1185,7 @@ Your support helps me continue creating open-source tools and improving this pro
 *Microsoft MVP (AI & Azure) | DevOps/AI Engineer | Open Source Contributor*
 
 **Damilola Onadeinde**
-DevOps/AI Engineer | Cloud Infrastructure Specialist | Open Source Contributor*
+DevOps/AI Engineer | Cloud Infrastructure Specialist | Open Source Contributor
 
 Connect with me:
 - GitHub: [@promiseuche](https://github.com/promiseuche)
