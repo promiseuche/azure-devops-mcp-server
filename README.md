@@ -1171,18 +1171,21 @@ See `.env.example` for all available variables.
 - **OpenAI function calling not working**: Ensure Azure OpenAI credentials are set and the deployment is active.
 - **Tool returns empty results**: The Azure DevOps API may have no data; check your project/team names.
 
-## ☕ Support the Developer
+## ☕ Support the Developers
 
-If you find this project helpful and would like to support my work, consider buying me a coffee!
+If you find this project helpful and would like to support our work, consider buying me a coffee!
 
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Support%20My%20Work-orange?style=for-the-badge&logo=buymeacoffee)](https://buymeacoffee.com/promiseuche)
 
 Your support helps me continue creating open-source tools and improving this project!
 
-## 👨‍💻 About the Developer
+## 👨‍💻 About the Developers
 
 **Promise Uche Nwachukwu**
-*Microsoft MVP (Azure & AI) | DevOps/AI Engineer | Cloud Infrastructure Specialist | Open Source Contributor*
+*Microsoft MVP (AI & Azure) | DevOps/AI Engineer | Open Source Contributor*
+
+**Damilola Onadeinde**
+DevOps/AI Engineer | Cloud Infrastructure Specialist | Open Source Contributor*
 
 Connect with me:
 - GitHub: [@promiseuche](https://github.com/promiseuche)
@@ -1212,4 +1215,4 @@ For issues or questions:
 
 ---
 
-*Built with ❤️ Promise Uche Nwachukwu In Collaboration With Damilola Onadeinde | [Support my work](https://buymeacoffee.com/promiseuche)*
+*Built with ❤️ Promise Uche Nwachukwu In Collaboration With Damilola Onadeinde | [Support our work](https://buymeacoffee.com/promiseuche)*
